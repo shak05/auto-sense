@@ -1,31 +1,42 @@
-# main.py
+
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor 
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import accuracy_score
+from fastapi.middleware.cors import CORSMiddleware
 import joblib
 import os
 
+# ==================================================================
+# Load the RAW CSV
+CSV_PATH = "UsedCarDataset.csv"
+# ==================================================================
+
 app = FastAPI(title="Used Car Price + Market Risk API")
 
-CSV_PATH = os.path.join("data", "UsedCarDataset.csv")  # adjust path if needed
+origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ---------- Load dataset ----------
+# ---------- Load & Clean RAW Dataset ----------
 if not os.path.exists(CSV_PATH):
-    raise RuntimeError(f"CSV not found at {CSV_PATH}. Put your CSV at this path.")
+    raise RuntimeError(f"RAW CSV not found at {CSV_PATH}. Please ensure 'UsedCarDataset.csv' is in the project root.")
 
-df = pd.read_csv(CSV_PATH)
+df = pd.read_csv(CSV_PATH, index_col=0)
 
-# ---------- Clean / normalize columns ----------
-# rename awkward column names
+# 1. Rename awkward column names from RAW CSV
 rename_map = {
     "price(in lakhs)": "price_in_lakhs",
     "mileage(kmpl)": "mileagekmpl",
@@ -35,80 +46,44 @@ rename_map = {
 }
 df.rename(columns=rename_map, inplace=True)
 
-# ensure price numeric
+# 2. Coerce price
 df['price_in_lakhs'] = pd.to_numeric(df['price_in_lakhs'], errors='coerce')
 
-# create a 'brand' extracted from car_name (first token) to reduce cardinality
-df['brand'] = df['car_name'].astype(str).apply(lambda s: s.split()[0] if isinstance(s, str) else 'Unknown')
-
-# convert manufacturing_year to numeric (coerce errors)
-df['manufacturing_year'] = pd.to_numeric(df['manufacturing_year'], errors='coerce')
-
-# compute age feature (use manufacturing_year if available; otherwise try to parse registration_year)
-CURRENT_YEAR = pd.Timestamp.now().year
-def compute_age(row):
-    if pd.notna(row.get('manufacturing_year')):
-        return CURRENT_YEAR - int(row['manufacturing_year'])
-    # fallback: try to extract year from registration_year if it's numeric-ish
-    ry = str(row.get('registration_year', ''))
-    import re
-    m = re.search(r'(\d{4})', ry)
-    if m:
-        try:
-            return CURRENT_YEAR - int(m.group(1))
-        except:
-            return np.nan
-    # maybe format like '17-Jul' -> treat as 2017 if '17' seems year
-    m2 = re.match(r'(\d{2})', ry)
-    if m2:
-        y = int(m2.group(1))
-        # heuristic: if > 30 then 19xx else 20xx
-        if y > 30:
-            y = 1900 + y
-        else:
-            y = 2000 + y
-        return CURRENT_YEAR - y
-    return np.nan
-
-df['age'] = df.apply(compute_age, axis=1)
-
-# numeric fields: coerce to numeric
-numeric_cols = ['seats', 'kms_driven', 'mileagekmpl', 'enginecc', 'max_powerbhp', 'torqueNm', 'age', 'price_in_lakhs']
-for c in numeric_cols:
-    if c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
-
-# fill missing numeric with median
-for c in numeric_cols:
-    if c in df.columns:
-        df[c].fillna(df[c].median(), inplace=True)
-
-# categorical columns to use
-categorical = ['brand', 'insurance_validity', 'fuel_type', 'ownsership', 'transmission']
-for c in categorical:
-    if c not in df.columns:
-        df[c] = 'Unknown'
-    df[c] = df[c].fillna('Unknown').astype(str)
-
-# reduce brand cardinality: keep top 12 brands, rest -> "Other"
+# 3. Create 'brand' feature and reduce cardinality
+"""df['brand'] = df['car_name'].astype(str).apply(lambda s: s.split()[0] if isinstance(s, str) else 'Unknown')
+top_brands = df['brand'].value_counts().nlargest(12).index.tolist()
+df['brand'] = df['brand'].apply(lambda b: b if b in top_brands else 'Other')"""
+# Take the second word as brand (assuming format "<year> <brand> ...")
+df['brand'] = df['car_name'].astype(str).apply(lambda s: s.split()[1] if len(s.split()) > 1 else 'Unknown')
 top_brands = df['brand'].value_counts().nlargest(12).index.tolist()
 df['brand'] = df['brand'].apply(lambda b: b if b in top_brands else 'Other')
 
-# ---------- Features for regression/classification ----------
-# For price regression we use a mixture of numeric + categorical (brand)
-features = ['brand', 'fuel_type', 'transmission', 'ownsership', 'insurance_validity',
-            'seats', 'kms_driven', 'mileagekmpl', 'enginecc', 'max_powerbhp', 'torqueNm', 'age']
 
+# 4. Compute Age feature from manufacturing_year
+CURRENT_YEAR = pd.Timestamp.now().year
+df['manufacturing_year'] = pd.to_numeric(df['manufacturing_year'], errors='coerce')
+df['age'] = CURRENT_YEAR - df['manufacturing_year']
+
+# 5. Define Feature Lists
 target_price = 'price_in_lakhs'
+features = ['brand', 'fuel_type', 'transmission', 'ownsership', 'insurance_validity',
+            'seats', 'kms_driven', 'mileagekmpl', 'age'] 
 
-# ensure the feature columns exist
-for f in features:
-    if f not in df.columns:
-        df[f] = 0
+# 6. Final Imputation 
+for c in features + [target_price]:
+    if c not in df.columns:
+        df[c] = np.nan
 
-# ---------- Preprocessor & models ----------
+    if df[c].dtype in [np.dtype('float64'), np.dtype('int64')]:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+        df[c] = df[c].fillna(df[c].median())
+    else:
+        df[c] = df[c].fillna('Unknown').astype(str)
+
+
+# ---------- Preprocessor & Model Training (Price) ----------
 cat_features = ['brand', 'fuel_type', 'transmission', 'ownsership', 'insurance_validity']
-num_features = ['seats', 'kms_driven', 'mileagekmpl', 'enginecc', 'max_powerbhp', 'torqueNm', 'age']
+num_features = ['seats', 'kms_driven', 'mileagekmpl', 'age'] 
 
 preprocessor = ColumnTransformer(
     transformers=[
@@ -118,220 +93,263 @@ preprocessor = ColumnTransformer(
     remainder='drop'
 )
 
+# Price Prediction Pipeline (Random Forest Regressor)
 price_pipeline = Pipeline([
     ('pre', preprocessor),
-    ('reg', LinearRegression())
+    ('reg', RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)) 
 ])
 
-# ---------- Prepare data and train regression ----------
 X = df[features]
 y = df[target_price]
-
-# drop rows where target missing
 mask = y.notna()
 X = X[mask]
 y = y[mask]
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.18, random_state=42)
-price_pipeline.fit(X_train, y_train)
+# Apply LOG TRANSFORMATION TO TARGET VARIABLE
+y_log = np.log1p(y)
 
-# optional: evaluate
-train_score = price_pipeline.score(X_train, y_train)
-test_score = price_pipeline.score(X_test, y_test)
+X_train, X_test, y_log_train, y_log_test = train_test_split(X, y_log, test_size=0.18, random_state=42)
+price_pipeline.fit(X_train, y_log_train)
 
-# ---------- Market risk clustering ----------
-# We'll cluster on (age, kms_driven, price) and then map clusters to risk label:
-cluster_df = df[['age', 'kms_driven', 'price_in_lakhs']].copy()
+train_score = price_pipeline.score(X_train, y_log_train)
+test_score = price_pipeline.score(X_test, y_log_test)
+
+
+import joblib
+
+scaler_2f = joblib.load("results/scaler_2f.joblib")
+kmeans_2f = joblib.load("results/kmeans_2f.joblib")
+risk_map_2f = joblib.load("results/risk_map_2f.joblib")
+
+
+
+# ---------- Market Risk Clustering (K-Means) ----------
+from sklearn.preprocessing import StandardScaler
+
+# Select key features
+cluster_cols = ['age', 'kms_driven', 'price_in_lakhs']
+cluster_df = df[cluster_cols].copy()
 cluster_df.fillna(cluster_df.median(), inplace=True)
-# KMeans with 3 clusters (Low, Medium, High risk)
-kmeans = KMeans(n_clusters=3, random_state=42)
-kmeans.fit(cluster_df)
-cluster_labels = kmeans.labels_
 
-# assign cluster label into DataFrame
-df['cluster_label'] = cluster_labels
+# Apply scaling for balance
+scaler = StandardScaler()
+cluster_scaled = scaler.fit_transform(cluster_df)
 
-# compute cluster mean price to sort risk ordering:
+# Apply feature weighting (age and kms matter more than price)
+weights = np.array([1.5, 1.5, 0.7])   # adjust these ratios if needed
+cluster_scaled_weighted = cluster_scaled * weights
+
+# Fit K-Means
+kmeans = KMeans(n_clusters=3, random_state=42, n_init='auto')
+kmeans.fit(cluster_scaled_weighted)
+df['cluster_label'] = kmeans.labels_
+
+# Map cluster ID to Risk Label based on mean price
 cluster_mean_price = df.groupby('cluster_label')['price_in_lakhs'].mean().sort_values()
-
-# map cluster id -> risk: lowest mean price -> High risk, middle -> Medium, highest -> Low
 cluster_order = list(cluster_mean_price.index)
+
 risk_map = {}
 if len(cluster_order) >= 3:
-    # cluster_order[0] lowest price -> High risk
-    risk_map[cluster_order[0]] = 'High'
+    risk_map[cluster_order[0]] = 'High'   # lowest mean price → highest risk
     risk_map[cluster_order[1]] = 'Medium'
-    risk_map[cluster_order[2]] = 'Low'
+    risk_map[cluster_order[2]] = 'Low'    # highest mean price → lowest risk
 else:
-    # fallback
     for i, cid in enumerate(cluster_order):
         risk_map[cid] = ['High', 'Medium', 'Low'][i]
 
 df['market_risk'] = df['cluster_label'].map(risk_map)
 
-# ---------- Train a classifier to predict market_risk from same features as regression ----------
-# Convert market_risk to numeric labels
-df['market_risk_label'] = df['market_risk'].map({'Low': 0, 'Medium': 1, 'High': 2})
 
-# For classifier, reuse preprocessor but maybe simpler OneHot + StandardScaler via a pipeline
-clf_pipeline = Pipeline([
-    ('pre', preprocessor),
-    ('clf', DecisionTreeClassifier(max_depth=6, random_state=42))
-])
+# Save models
+os.makedirs("results", exist_ok=True)
+joblib.dump(price_pipeline, "results/price_pipeline.joblib")
+joblib.dump(kmeans, "results/kmeans_model.joblib")
+joblib.dump(scaler, "results/kmeans_scaler.joblib")
 
-clf_mask = df['market_risk_label'].notna()
-X_clf = df.loc[clf_mask, features]
-y_clf = df.loc[clf_mask, 'market_risk_label']
 
-Xc_train, Xc_test, yc_train, yc_test = train_test_split(X_clf, y_clf, test_size=0.18, random_state=42)
-clf_pipeline.fit(Xc_train, yc_train)
-clf_acc = accuracy_score(yc_test, clf_pipeline.predict(Xc_test))
+# ---------- Pydantic Models & API Endpoints ----------
 
-# Save models to disk (optional)
-joblib.dump(price_pipeline, "price_pipeline.joblib")
-joblib.dump(clf_pipeline, "risk_pipeline.joblib")
-joblib.dump(kmeans, "kmeans_model.joblib")
-
-# ---------- Pydantic models for predict endpoints ----------
 class CarFeatures(BaseModel):
     car_name: str = None
-    registration_year: str = None
-    insurance_validity: str = None
     fuel_type: str = None
+    transmission: str = None
+    ownership: str = None
+    insurance_validity: str = None
     seats: int = None
     kms_driven: int = None
-    ownsership: str = None
-    transmission: str = None
-    manufacturing_year: int = None
     mileagekmpl: float = None
-    enginecc: float = None
-    max_powerbhp: float = None
-    torqueNm: float = None
+    enginecc: float = None 
+    max_powerbhp: float = None 
+    torqueNm: float = None 
+    manufacturing_year: int = None
 
-# ---------- API endpoints ----------
+
 @app.get("/")
 def root():
     return {"message": "Used Car Price + Market Risk API is running."}
+
 
 @app.get("/summary")
 def summary():
     return {
         "rows": int(df.shape[0]),
         "columns": int(df.shape[1]),
-        "columns_list": df.columns.tolist(),
-        "price_train_score": float(train_score),
-        "price_test_score": float(test_score),
-        "risk_classifier_accuracy": float(clf_acc)
+        "price_test_score": round(float(test_score), 3),
+        "cluster_risks": risk_map
     }
 
-@app.get("/eda")
-def eda():
-    # return simple correlations for numeric columns
-    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
-    corr = df[numeric].corr().round(3).to_dict()
-    # return top brand counts
-    brand_counts = df['brand'].value_counts().head(12).to_dict()
-    return {"correlations": corr, "brand_counts": brand_counts}
-
-@app.get("/clusters")
-def clusters():
-    centers = kmeans.cluster_centers_.tolist()
-    # sample few rows with cluster and risk
-    sample = df[['car_name', 'age', 'kms_driven', 'price_in_lakhs', 'cluster_label', 'market_risk']].head(40).to_dict(orient='records')
-    return {"centers": centers, "sample": sample, "risk_map": risk_map}
 
 @app.post("/predict_price")
 def predict_price(car: CarFeatures):
-    # build single-row DataFrame in same format as training features
     payload = car.dict()
-    # brand extraction
-    brand = (payload.get('car_name') or '').split()[0] if payload.get('car_name') else 'Unknown'
+    brand = (payload.get('car_name') or '').split()[0] if payload.get('car_name') else 'Other'
     if brand not in top_brands:
         brand = 'Other'
+        
     row = {
         'brand': brand,
         'fuel_type': payload.get('fuel_type') or 'Unknown',
         'transmission': payload.get('transmission') or 'Unknown',
-        'ownsership': payload.get('ownsership') or 'Unknown',
+        'ownership': payload.get('ownership') or 'Unknown',
         'insurance_validity': payload.get('insurance_validity') or 'Unknown',
         'seats': payload.get('seats') or df['seats'].median(),
         'kms_driven': payload.get('kms_driven') or df['kms_driven'].median(),
         'mileagekmpl': payload.get('mileagekmpl') or df['mileagekmpl'].median(),
-        'enginecc': payload.get('enginecc') or df['enginecc'].median(),
-        'max_powerbhp': payload.get('max_powerbhp') or df['max_powerbhp'].median(),
-        'torqueNm': payload.get('torqueNm') or df['torqueNm'].median(),
         'age': None
     }
-    # compute age from manufacturing_year if provided
+    
     my = payload.get('manufacturing_year')
-    if my:
-        row['age'] = CURRENT_YEAR - int(my)
-    else:
-        row['age'] = df['age'].median()
-    Xpred = pd.DataFrame([row])[features]
-    pred = price_pipeline.predict(Xpred)[0]
+    row['age'] = CURRENT_YEAR - int(my) if my else df['age'].median()
+    
+    Xpred = pd.DataFrame([row])[features] 
+    pred_log = price_pipeline.predict(Xpred)[0]
+    pred = np.expm1(pred_log) 
+    
     return {"predicted_price_in_lakhs": round(float(pred), 2)}
+
+
+
+"""
+
 
 @app.post("/predict_risk")
 def predict_risk(car: CarFeatures):
     payload = car.dict()
-    brand = (payload.get('car_name') or '').split()[0] if payload.get('car_name') else 'Unknown'
+
+    # Compute age
+    age = CURRENT_YEAR - int(payload.get('manufacturing_year')) if payload.get('manufacturing_year') else df['age'].median()
+    kms_driven = float(payload.get('kms_driven') or df['kms_driven'].median())
+    ownsership = payload.get('ownsership') or 'Unknown'
+
+    # --- Predict price using pipeline ---
+    brand = (payload.get('car_name') or '').split()[0] if payload.get('car_name') else 'Other'
     if brand not in top_brands:
         brand = 'Other'
+
     row = {
         'brand': brand,
         'fuel_type': payload.get('fuel_type') or 'Unknown',
         'transmission': payload.get('transmission') or 'Unknown',
-        'ownsership': payload.get('ownsership') or 'Unknown',
+        'ownsership': ownsership,
         'insurance_validity': payload.get('insurance_validity') or 'Unknown',
-        'seats': payload.get('seats') or int(df['seats'].median()),
-        'kms_driven': payload.get('kms_driven') or int(df['kms_driven'].median()),
-        'mileagekmpl': payload.get('mileagekmpl') or float(df['mileagekmpl'].median()),
-        'enginecc': payload.get('enginecc') or float(df['enginecc'].median()),
-        'max_powerbhp': payload.get('max_powerbhp') or float(df['max_powerbhp'].median()),
-        'torqueNm': payload.get('torqueNm') or float(df['torqueNm'].median()),
-        'age': None
+        'seats': payload.get('seats') or df['seats'].median(),
+        'kms_driven': kms_driven,
+        'mileagekmpl': payload.get('mileagekmpl') or df['mileagekmpl'].median(),
+        'age': age
     }
-    my = payload.get('manufacturing_year')
-    if my:
-        row['age'] = CURRENT_YEAR - int(my)
+
+    Xpred_price = pd.DataFrame([row])[features]
+    pred_log = price_pipeline.predict(Xpred_price)[0]
+    predicted_price = np.expm1(pred_log)
+
+    # --- Adjust price based on ownership ---
+    if ownsership.lower() == '2nd owner':
+        predicted_price *= 0.85  # reduce by 15%
+    elif ownsership.lower() == '3rd owner':
+        predicted_price *= 0.7   # reduce by 30%
+
+    # --- Determine risk ---
+    if ownsership.lower() == '3rd owner':
+        predicted_risk = 'High'
+        cluster_id = None
     else:
-        row['age'] = df['age'].median()
+        # KMeans-based risk
+        kmeans_input = np.array([[age, kms_driven]])
+        scaled_input = scaler_2f.transform(kmeans_input) * np.array([1.5, 1.5])
+        cluster_id = kmeans_2f.predict(scaled_input)[0]
+        predicted_risk = risk_map_2f.get(cluster_id, "Unknown")
 
-    Xpred = pd.DataFrame([row])[features]
-    pred_label = clf_pipeline.predict(Xpred)[0]
-    inv_map = {0:'Low',1:'Medium',2:'High'}
-    return {"predicted_market_risk": inv_map.get(int(pred_label), "Unknown")}
+    return {
+        "predicted_market_risk": predicted_risk,
+        "predicted_price_in_lakhs": round(float(predicted_price), 2),
+        "cluster_id": None if ownsership.lower() == '3rd owner' else int(cluster_id),
+        "age": int(age),
+        "kms_driven": kms_driven,
+        "ownsership": ownsership
+    }
+"""
 
-# optional endpoint to return a few rows sample
-@app.get("/sample")
-def sample(n: int = 20):
-    return df.head(n).to_dict(orient='records')
 
-from pydantic import BaseModel
+@app.post("/predict_risk")
+def predict_risk(car: CarFeatures):
+    payload = car.dict()
 
-class CarFeatures(BaseModel):
-    registration_year: int
-    kms_driven: float
-    seats: int
-    enginecc: float
-    max_powerbhp: float
-    mileagekmpl: float
+    # Compute age
+    my = payload.get('manufacturing_year')
+    age = CURRENT_YEAR - int(my) if my else 0
 
-@app.post("/predict")
-def predict_price(car: CarFeatures):
-    try:
-        # Put inputs into same order as features list
-        input_data = pd.DataFrame([[
-            car.registration_year,
-            car.kms_driven,
-            car.seats,
-            car.enginecc,
-            car.max_powerbhp,
-            car.mileagekmpl
-        ]], columns=features)
+    kms_driven = float(payload.get('kms_driven') or 0)
+    ownership = payload.get('ownership', '').lower().strip()
+    mileage = float(payload.get('mileagekmpl') or 0)
 
-        prediction = model.predict(input_data)[0]
-        return {"predicted_price_in_lakhs": round(float(prediction), 2)}
-    except Exception as e:
-        return {"error": str(e)}
+    # Base KMeans prediction
+    kmeans_input = np.array([[age, kms_driven]])
+    scaled_input = scaler_2f.transform(kmeans_input) * np.array([1.5, 1.5])
+    cluster_id = kmeans_2f.predict(scaled_input)[0]
+    predicted_risk = risk_map_2f.get(cluster_id, "Unknown")
+
+    # --- Ownership logic ---
+    ownership_factor = 1.0
+    if "second" in ownership:
+        ownership_factor = 0.93    # Slight drop
+    elif "third" in ownership:
+        ownership_factor = 0.87    # Noticeable drop
+        predicted_risk = "High"    # Automatically high risk
+    elif "fourth" in ownership:
+        ownership_factor = 0.80
+        predicted_risk = "High"
+
+    # --- Price estimation (simple illustrative model) ---
+    base_price = max(2, 12 - (age * 0.4) - (kms_driven / 30000))
+    price_adjusted = base_price * ownership_factor * (1 + (mileage - 15) / 100)
+
+    return {
+        "predicted_market_risk": predicted_risk,
+        "predicted_price_in_lakhs": round(price_adjusted, 2),
+        "age": int(age),
+        "kms_driven": kms_driven,
+        "ownership": ownership.title()
+    }
+
+
+@app.get("/car_names")
+def get_car_names():
+    return {"car_names": sorted(df['car_name'].unique().tolist())}
+
+
+@app.get("/clusters")
+def clusters():
+    centers = kmeans.cluster_centers_.tolist()
+    sample = df[['car_name', 'age', 'kms_driven', 'price_in_lakhs', 'cluster_label', 'market_risk']].head(40).to_dict(orient='records')
+    return {"centers": centers, "sample": sample, "risk_map": risk_map}
+
+
+@app.get("/eda")
+def eda():
+    numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+    clean_numeric = [c for c in numeric if c not in ['enginecc', 'max_powerbhp', 'torqueNm']]
+    corr_dict = df[clean_numeric].corr().round(3).to_dict()
+    brand_counts = df["brand"].value_counts().head(10).to_dict()
+    return {"correlations": corr_dict, "brand_counts": brand_counts}
+
+

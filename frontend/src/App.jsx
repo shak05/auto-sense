@@ -13,7 +13,7 @@ export default function App() {
     <div className="app-container">
       {/* Transparent navbar */}
       <nav className="navbar glass">
-        <div className="logo">🚗 CarPriceLab</div>
+        <div className="logo">🚗 AutoSense</div>
         <div className="navlinks">
           <NavLink to="/" end>Home</NavLink>
           <NavLink to="/summary">Summary</NavLink>
