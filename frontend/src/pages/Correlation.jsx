@@ -1,38 +1,5 @@
-/*import React, { useEffect, useState } from "react";
-import API from "../services/api";
-import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
-export default function Correlation() {
-  const [cars, setCars] = useState([]);
 
-// --- FIXED CODE ---
-useEffect(() => {
-  // Use the existing /clusters endpoint which returns a 'sample' list
-  API.get("/clusters").then((res) => setCars(res.data.sample));
-  }, []);
-
-  const scatterData = cars.map((c) => ({
-    x: c.kms_driven,
-    y: c.price_in_lakhs,
-    name: c.car_name,
-  }));
-
-  return (
-    <div className="panel">
-      <h2>Correlation Analysis (Kms vs Price)</h2>
-      <ResponsiveContainer width="100%" height={300}>
-        <ScatterChart>
-          <CartesianGrid />
-          <XAxis type="number" dataKey="x" name="Kms Driven" />
-          <YAxis type="number" dataKey="y" name="Price" />
-          <Tooltip cursor={{ strokeDasharray: "3 3" }} />
-          <Scatter data={scatterData} fill="#00d1ff" />
-        </ScatterChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-*/
 
 import API from "../services/api";
 
@@ -91,7 +58,7 @@ export default function Correlation() {
   return (
     <div className="w-full max-w-6xl mx-auto p-8">
       <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 rounded-2xl shadow-2xl border border-cyan-500/30 p-8">
-        {/* Header */}
+       
         <div className="mb-8">
           <h1 className="text-4xl font-bold bg-gradient-to-r from-cyan-400 to-emerald-400 bg-clip-text text-transparent mb-2">
             Correlation Analysis
@@ -111,7 +78,7 @@ export default function Correlation() {
           </div>
         </div>
 
-        {/* Chart Container */}
+        
         <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-6 backdrop-blur-sm">
           {loading ? (
             <div className="h-96 flex items-center justify-center">
@@ -174,7 +141,7 @@ export default function Correlation() {
           )}
         </div>
 
-        {/* Stats Footer */}
+    
         <div className="mt-6 grid grid-cols-3 gap-4">
           <div className="bg-slate-700/50 rounded-lg p-4 border border-slate-600/50">
             <p className="text-slate-400 text-sm mb-1">Total Samples</p>
